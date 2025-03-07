@@ -1,28 +1,18 @@
 /*
-	Copyright 2019 Benjamin Vedder	benjamin@vedder.se
+    Copyright 2025 Yann Pomarede yann.pomarede@gmail.com
+    This file is part of the VESC firmware.
+    License: GNU General Public License v3
+*/
 
-	This file is part of the VESC firmware.
-
-	The VESC firmware is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    The VESC firmware is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-    */
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "app.h"
 #include "ch.h"
 #include "hal.h"
 #include "general.h"
-
-// Some useful includes
 #include "mc_interface.h"
 #include "mcpwm_foc.h"
 #include "utils_math.h"
@@ -32,278 +22,250 @@
 #include "hw.h"
 #include "commands.h"
 #include "timeout.h"
-
 #include "util/digital_filter.h"
 
-#include <math.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#define LOOP_PERIOD 0.002f // 500 Hz
+#define LOOP_PERIOD_MS ((int)(1000*LOOP_PERIOD))
 
-// 10000 eRPM = cadence 60
+#define BAFANG_CADENCE_TO_ERPM_RATIO (10000.0f/60.0f)  // 10k ERPM at 60 RPM
+#define BAFANG_CADENCE_TO_ERPM(cadence) ((cadence)*BAFANG_CADENCE_TO_ERPM_RATIO)
+#define BAFANG_ERPM_TO_CADENCE(erpm) ((erpm)/BAFANG_CADENCE_TO_ERPM_RATIO)
+
 
 // Threads
 static THD_FUNCTION(my_thread, arg);
 static THD_WORKING_AREA(my_thread_wa, 1024);
 
 // Private functions
-static void terminal_debug(int argc, const char **argv);
-static void terminal_pid(int argc, const char **argv);
-static void terminal_current(int argc, const char **argv);
-static void terminal_rpm(int argc, const char **argv);
-static void terminal_goal(int argc, const char **argv);
+static void terminal(int argc, const char **argv);
 
 // Private variables
 static volatile bool stop_now = true;
 static volatile bool is_running = false;
 
+// Config
+static volatile float rpm_on = 3.0f;
+static volatile float rpm_off = 1.5f;
+static volatile float rpm_max = 100.0f;
+static volatile float rpm_mini = 30.0f;
+static volatile float min_brake_current = 0.1f;
+static volatile float max_brake_current = 10.0f;
+static volatile float pid_p = 0.8f; // Current / RPM
+static volatile float pid_i = 40.0f;
+static volatile float pid_d = 0.035f;
+static volatile float d_filter_coeff = 0.2f;
+static volatile float inertia = 0.2f;
+static volatile float squared_losses_coeff = 2.0f; // A for 60 RPM
+
 // Live data
 static float actual_rpm = 0.0f;
-// static volatile float actual_rpm_fast = 0.0f;
-static float goal_rpm = 6000.0f;
+static float rpm_goal = 0.0f;
 static float e_rpm = 0.0f;
 static float e_rpm_prev = 0.0f;
-// static volatile float e_rpm_fast = 0.0f;
 static float cmd_current = 0.0f;
 static bool power_on = false;
-// static volatile int power_off_tick = 0;
-
 static float p_term = 0.0f;
 static float i_term = 0.0f;
 static float d_term = 0.0f;
 static float d_term_filtered = 0.0f;
-static float d_term_filtered2 = 0.0f;
-static Biquad d_term_filter = {};
 
+static float current_bus = 0.0f;
+static float voltage_bus = 0.0f;
+static float watt = 0.0f;
+static float watt_filtered = 0.0f;
+static Biquad watt_filter1 = {};
+static Biquad watt_filter2 = {};
 
-// Config
-static volatile float rpm_on = 500.0f;
-static volatile float rpm_off = 250.0f;
-static volatile float min_brake_current = 0.1f;
-static volatile float max_brake_current = 10.0f;
-static volatile float pid_p = 0.005f; // Current / RPM
-static volatile float pid_i = 0.2f;
-static volatile float pid_d = 0.0002f;
-static volatile float d_lpf_freq = 80.0f;
-static volatile float d_filter_coeff = 0.2f;
+typedef struct {
+    char * name;
+    volatile float * value;
+    char * description;
+} param_t;
 
-
-
-#define TRUNC_FLOAT_RANGE(val, min, max) (val < min ? min : (val > max ? max : val))
-
-// 500 Hz
-#define LOOP_PERIOD 0.002f
-#define LOOP_PERIOD_MS ((int)(1000*LOOP_PERIOD))
+static param_t PARAMETERS[] = {
+    {"Kp", &pid_p, "Proportional gain"},
+    {"Ki", &pid_i, "Integral gain"},
+    {"Kd", &pid_d, "Derivative gain"},
+    {"df", &d_filter_coeff, "Derivative filter coefficient"},
+    {"Cmin", &min_brake_current, "Minimum current (A)"},
+    {"Cmax", &max_brake_current, "Maximum current (A)"},
+    {"ron", &rpm_on, "RPM to turn on"},
+    {"roff", &rpm_off, "RPM to turn off"},
+    {"rmax", &rpm_max, "Maximum RPM"},
+    {"rmini", &rpm_mini, "Minimum RPM goal"},
+    {"inertia", &inertia, "Inertia"},
+    {"loss", &squared_losses_coeff, "Squared losses coefficient (Current for 60 RPM)"}
+};
 
 
 
 // Called when the custom application is started. Start our
 // threads here and set up callbacks.
 void app_custom_start(void) {
-	// mc_interface_set_pwm_callback(pwm_callback);
+    stop_now = false;
+    chThdCreateStatic(my_thread_wa, sizeof(my_thread_wa), NORMALPRIO, my_thread, NULL);
 
-	stop_now = false;
-	chThdCreateStatic(my_thread_wa, sizeof(my_thread_wa),
-			NORMALPRIO, my_thread, NULL);
+    // Terminal commands for the VESC Tool terminal can be registered.
+    terminal_register_command_callback("gene", "Print the Gene parameters", 0, terminal);
 
-	// Terminal commands for the VESC Tool terminal can be registered.
-	terminal_register_command_callback(
-			"gene_debug",
-			"Print the Gene debug stuff",
-			0,
-			terminal_debug);
-	terminal_register_command_callback(
-			"gene_pid",
-			"Get/Set Gene PID Gains",
-			0,
-			terminal_pid);
-	terminal_register_command_callback(
-			"gene_current",
-			"Get/Set Gene Currents",
-			0,
-			terminal_current);
-	terminal_register_command_callback(
-			"gene_rpm",
-			"Get/Set Gene RPM ON/OFF",
-			0,
-			terminal_rpm);
-	terminal_register_command_callback(
-		"gene_goal",
-		"Get/Set Gene GOAL RPM",
-		0,
-		terminal_goal);
-
-	biquad_config(&d_term_filter, BQ_LOWPASS, LOOP_PERIOD*d_lpf_freq);
+    biquad_config(&watt_filter1, BQ_LOWPASS, LOOP_PERIOD*5.0f);
+    biquad_config(&watt_filter2, BQ_LOWPASS, LOOP_PERIOD*0.25f);
 }
 
 // Called when the custom application is stopped. Stop our threads
 // and release callbacks.
 void app_custom_stop(void) {
-	mc_interface_set_pwm_callback(0);
-	terminal_unregister_callback(terminal_debug);
+    mc_interface_set_pwm_callback(0);
+    terminal_unregister_callback(terminal);
 
-	stop_now = true;
-	while (is_running) {
-		chThdSleepMilliseconds(1);
-	}
+    stop_now = true;
+    while (is_running) {
+        chThdSleepMilliseconds(1);
+    }
 }
 
 void app_custom_configure(app_configuration *conf) {
-	(void)conf;
+    (void)conf;
 }
 
 static THD_FUNCTION(my_thread, arg) {
-	(void)arg;
+    (void)arg;
 
-	chRegSetThreadName("APP_GENE");
+    chRegSetThreadName("APP_GENE");
 
-	is_running = true;
+    is_running = true;
 
-	// Experiment plot
-	commands_init_plot("X", "Y");
-	commands_plot_add_graph("RPM");
-	commands_plot_add_graph("Current");
-	commands_plot_add_graph("P Term");
-	commands_plot_add_graph("I Term");
-	commands_plot_add_graph("D Term");
-	commands_plot_add_graph("D Term filtered");
+    // Experiment plot
+    commands_init_plot("X", "Y");
+    commands_plot_add_graph("RPM goal");
+    commands_plot_add_graph("RPM");
+    commands_plot_add_graph("Current");
+    commands_plot_add_graph("Watt");
+    commands_plot_add_graph("Watt filtered");
+    // commands_plot_add_graph("P Term");
+    // commands_plot_add_graph("I Term");
+    // commands_plot_add_graph("D Term");
 
-	systime_t next_time = chVTGetSystemTimeX();  // Get current system time
+    systime_t next_time = chVTGetSystemTimeX();  // Get current system time
 
-	int loop_n = 0;
-	while (true) {
-		// Check if it is time to stop.
-		if (stop_now) {
-			is_running = false;
-			return;
-		}
-		timeout_reset(); // Reset timeout if everything is OK.
+    int loop_n = 0;
+    while (true) {
+        // Check if it is time to stop.
+        if (stop_now) {
+            is_running = false;
+            return;
+        }
+        timeout_reset(); // Reset timeout if everything is OK.
 
-		// RPM error
-		actual_rpm = mc_interface_get_rpm();
-		// actual_rpm_fast = mcpwm_foc_get_rpm_fast();
+        // RPM error
+        actual_rpm = BAFANG_ERPM_TO_CADENCE(mc_interface_get_rpm());
 
-		e_rpm = actual_rpm - goal_rpm;
-		// e_rpm_fast = actual_rpm_fast - goal_rpm;
-		
-		p_term = pid_p * e_rpm;
+        e_rpm = actual_rpm - rpm_goal;
+        
+        p_term = pid_p * e_rpm;
 
-		d_term = pid_d * (e_rpm - e_rpm_prev) / LOOP_PERIOD;
+        d_term = pid_d * (e_rpm - e_rpm_prev) / LOOP_PERIOD;
 
-		d_term_filtered2 = biquad_process(&d_term_filter, d_term);
-		d_term_filtered += d_filter_coeff * (d_term - d_term_filtered);
+        d_term_filtered += d_filter_coeff * (d_term - d_term_filtered);
 
-		i_term += LOOP_PERIOD*(pid_i * e_rpm);
-		i_term = TRUNC_FLOAT_RANGE(i_term, 0, max_brake_current);
+        i_term += LOOP_PERIOD*(pid_i * e_rpm);
+        utils_truncate_number(&i_term, 0, max_brake_current);
 
-		e_rpm_prev = e_rpm;
+        e_rpm_prev = e_rpm;
 
-		cmd_current = p_term + d_term_filtered + i_term;
-		cmd_current = TRUNC_FLOAT_RANGE(cmd_current, min_brake_current, max_brake_current);
+        cmd_current = p_term + d_term_filtered + i_term;
+        utils_truncate_number(&cmd_current, min_brake_current, max_brake_current);
 
-		if (actual_rpm > rpm_on) {
-			power_on = true;
-			// power_off_tick = 0;
-		} else if (power_on && actual_rpm < rpm_off) {
-			// power_off_tick++;
-			mc_interface_release_motor();
-			power_on = false;
-		}
+        if (actual_rpm > rpm_on) {
+            power_on = true;
+        } else if (power_on && actual_rpm < rpm_off) {
+            mc_interface_release_motor();
+            power_on = false;
+        }
 
-		// if (power_on && power_off_tick > 100) {
-		// 	mc_interface_release_motor();
-		// 	power_on = false;
-		// }
+        // Compute the torques
+        float pedal_torque = cmd_current;
+        float friction_torque = min_brake_current;
+        float air_resistance_torque = squared_losses_coeff * (rpm_goal/60.0f) * (rpm_goal/60.0f);
+        float net_torque = pedal_torque - friction_torque - air_resistance_torque;
 
-		if (power_on) {
-			mc_interface_set_brake_current(cmd_current);
-		}
-		
-		if (power_on) {
-			commands_plot_set_graph(0);
-			commands_send_plot_points(loop_n, 0.001f*actual_rpm);
-			commands_plot_set_graph(1);
-			commands_send_plot_points(loop_n, cmd_current);
-			commands_plot_set_graph(2);
-			commands_send_plot_points(loop_n, p_term);
-			commands_plot_set_graph(3);
-			commands_send_plot_points(loop_n, i_term);
-			commands_plot_set_graph(4);
-			commands_send_plot_points(loop_n, d_term);
-			commands_plot_set_graph(5);
-			commands_send_plot_points(loop_n, d_term_filtered);
-		}
+        // Adjust the RPM goal
+        rpm_goal += net_torque * LOOP_PERIOD / inertia;
+        if (rpm_goal < rpm_mini) {
+            rpm_goal = rpm_mini;
+        } else if (rpm_goal > rpm_max) {
+            rpm_goal = rpm_max;
+        }
 
-		next_time += MS2ST(LOOP_PERIOD_MS);
-    	// Sleep until the next scheduled time
-    	chThdSleepUntil(next_time);
-		loop_n++;
-	}
+        // Drive motor
+        if (power_on) {
+            mc_interface_set_brake_current(cmd_current);
+        }
+
+        // Measure power
+        current_bus = fabsf(mc_interface_get_tot_current_in_filtered());
+        voltage_bus = mc_interface_get_input_voltage_filtered();
+        watt = biquad_process(&watt_filter1, voltage_bus * current_bus);
+        watt_filtered = biquad_process(&watt_filter2, watt);
+
+
+        // Plot
+        if (power_on && (loop_n%10==0)) {
+            float x = loop_n * LOOP_PERIOD;
+            commands_plot_set_graph(0);
+            commands_send_plot_points(x, rpm_goal);
+            commands_plot_set_graph(1);
+            commands_send_plot_points(x, actual_rpm);
+            commands_plot_set_graph(2);
+            commands_send_plot_points(x, cmd_current);
+            commands_plot_set_graph(3);
+            commands_send_plot_points(x, watt);
+            commands_plot_set_graph(4);
+            commands_send_plot_points(x, watt_filtered);
+            
+            // commands_plot_set_graph(0);
+            // commands_send_plot_points(x, rpm_goal);
+            // commands_plot_set_graph(1);
+            // commands_send_plot_points(x, actual_rpm);
+            // commands_plot_set_graph(2);
+            // commands_send_plot_points(x, cmd_current);
+            // commands_plot_set_graph(3);
+            // commands_send_plot_points(x, p_term);
+            // commands_plot_set_graph(4);
+            // commands_send_plot_points(x, i_term);
+            // commands_plot_set_graph(5);
+            // commands_send_plot_points(x, d_term);
+            
+        }
+
+        // Sleep until the next scheduled time
+        next_time += MS2ST(LOOP_PERIOD_MS);
+        chThdSleepUntil(next_time);
+        loop_n++;
+    }
 }
 
 // Callback function for the terminal command with arguments.
-static void terminal_debug(int argc, const char **argv) {
-	commands_printf("rpm: %.1f", (double)actual_rpm);
-	commands_printf("cmd_current: %.1f", (double)cmd_current);
+static void terminal(int argc, const char **argv) {
+    if (argc == 1) {
+        commands_printf("Gene parameters:");
+        for (size_t i = 0; i < sizeof(PARAMETERS)/sizeof(param_t); i++) {
+            commands_printf("  %s: %.3f", PARAMETERS[i].name, (double)*(PARAMETERS[i].value));
+        }
+    } else if (argc == 3) {
+        const char* param = argv[1];
+        float value = atof(argv[2]);
+        for (size_t i = 0; i < sizeof(PARAMETERS)/sizeof(param_t); i++) {
+            if (strcasecmp(param, PARAMETERS[i].name) == 0) {
+                float old_value = *(PARAMETERS[i].value);
+                *(PARAMETERS[i].value) = value;
+                commands_printf("Set %s from %.3f to %.3f", PARAMETERS[i].name, (double)old_value, (double)value);
+                return;
+            }
+        }
+        commands_printf("Invalid parameter");
+    } else {
+        commands_printf("Usage: gene [param] [value]");
+    }
 }
-
-static void terminal_pid(int argc, const char **argv) {	
-	if (argc == 3) {
-		const char* param = argv[1];
-		float value = atof(argv[2]);
-		if (strcasecmp(param, "P") == 0) {
-			pid_p = value;
-		} else if (strcasecmp(param, "I") == 0) {
-			pid_i = value;
-		} else if (strcasecmp(param, "D") == 0) {
-			pid_d = value;
-		} else if (strcasecmp(param, "C") == 0) {
-			d_filter_coeff = value;
-		} else if (strcasecmp(param, "F") == 0) {
-			d_lpf_freq = value;
-			biquad_config(&d_term_filter, BQ_LOWPASS, LOOP_PERIOD*d_lpf_freq);
-		} else {
-			commands_printf("Invalid parameter");
-			return;
-		}
-	} else if (argc != 1) {
-		commands_printf("Usage: gene_pid [P|I|D|F|C] [value]");
-		return;
-	}
-	commands_printf("PID P=%f I=%f D=%f D_LPF_FREQ F=%f C=%f", (double)pid_p, (double)pid_i, (double)pid_d, (double)d_lpf_freq, (double)d_filter_coeff);
-}
-
-static void terminal_current(int argc, const char **argv) {
-	if (argc == 3) {
-		min_brake_current = atof(argv[1]);
-		max_brake_current = atof(argv[2]);
-	} else if (argc != 1) {
-		commands_printf("Usage: gene_current [min] [max]");
-		return;
-	}
-	commands_printf("Current min=%.1f max=%.1f", (double)min_brake_current, (double)max_brake_current);
-}
-
-static void terminal_rpm(int argc, const char **argv) {	
-	if (argc == 3) {
-		rpm_on = atof(argv[1]);
-		rpm_off = atof(argv[2]);
-	} else if (argc != 1) {
-		commands_printf("Usage: gene_rpm [value_on] [value_off]");
-		return;
-	}
-	commands_printf("RPM on=%.1f off=%.1f", (double)rpm_on, (double)rpm_off);
-}
-
-
-static void terminal_goal(int argc, const char **argv) {	
-	if (argc == 2) {
-		goal_rpm = atof(argv[1]);
-	} else if (argc != 1) {
-		commands_printf("Usage: gene_goal [goal_rpm]");
-		return;
-	}
-	commands_printf("GOAL RPM %.1f", (double)goal_rpm);
-}
-
