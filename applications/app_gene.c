@@ -23,15 +23,21 @@
 #include "commands.h"
 #include "timeout.h"
 #include "util/digital_filter.h"
+#include "buffer.h"
 
 
 #define LOOP_PERIOD 0.002f // 500 Hz
-#define LOOP_PERIOD_MS ((int)(1000*LOOP_PERIOD))
+#define LOOP_PERIOD_MS ((int)(1000*LOOP_PERIOD)) // 2 ms
+
+#define CAN_PERIOD 0.1f // 10 Hz
+#define CAN_PERIOD_MS ((int)(1000*CAN_PERIOD)) // 100 ms
+#define CAN_LOOP_RATIO (CAN_PERIOD_MS/LOOP_PERIOD_MS) // 50
 
 #define BAFANG_CADENCE_TO_ERPM_RATIO (10000.0f/60.0f)  // 10k ERPM at 60 RPM
 #define BAFANG_CADENCE_TO_ERPM(cadence) ((cadence)*BAFANG_CADENCE_TO_ERPM_RATIO)
 #define BAFANG_ERPM_TO_CADENCE(erpm) ((erpm)/BAFANG_CADENCE_TO_ERPM_RATIO)
 
+#define CAN_PACKET_GENE 63
 
 // Threads
 static THD_FUNCTION(my_thread, arg);
@@ -149,6 +155,9 @@ static THD_FUNCTION(my_thread, arg) {
 
     systime_t next_time = chVTGetSystemTimeX();  // Get current system time
 
+    const app_configuration *conf = app_get_configuration();
+    const int can_id = conf->controller_id;
+
     int loop_n = 0;
     while (true) {
         // Check if it is time to stop.
@@ -237,6 +246,17 @@ static THD_FUNCTION(my_thread, arg) {
             // commands_plot_set_graph(5);
             // commands_send_plot_points(x, d_term);
             
+        }
+
+        // CAN
+        if (loop_n % CAN_LOOP_RATIO == 0) {
+            int32_t send_index = 0;
+            uint8_t buffer[6];
+            buffer_append_int16(buffer, (int16_t)(10.0f*rpm_goal), &send_index);
+            buffer_append_int16(buffer, (int16_t)(10.0f*actual_rpm), &send_index);
+            buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
+            comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
+        
         }
 
         // Sleep until the next scheduled time
