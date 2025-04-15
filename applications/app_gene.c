@@ -63,6 +63,8 @@ static volatile float pid_d = 0.035f;
 static volatile float d_filter_coeff = 0.2f;
 static volatile float inertia = 0.2f;
 static volatile float squared_losses_coeff = 2.0f; // A for 60 RPM
+static volatile float plot_freq = 10.0f; // 10 Hz
+static volatile float plot_mode = 1;
 
 // Live data
 static float actual_rpm = 0.0f;
@@ -101,7 +103,9 @@ static param_t PARAMETERS[] = {
     {"rmax", &rpm_max, "Maximum RPM"},
     {"rmini", &rpm_mini, "Minimum RPM goal"},
     {"inertia", &inertia, "Inertia"},
-    {"loss", &squared_losses_coeff, "Squared losses coefficient (Current for 60 RPM)"}
+    {"loss", &squared_losses_coeff, "Squared losses coefficient (Current for 60 RPM)"},
+    {"plot_freq", &plot_freq, "Plot frequency"},
+    {"plot_mode", &plot_mode, "0=off, 1=auto, 2=on"}
 };
 
 
@@ -220,7 +224,17 @@ static THD_FUNCTION(my_thread, arg) {
 
 
         // Plot
-        if (power_on && (loop_n%10==0)) {
+        // if (power_on && (loop_n%10==0)) {
+
+        const int modulo = 1.0f/(LOOP_PERIOD*plot_freq);
+
+        bool plot_active = false;
+        switch ((int)plot_mode)
+        {
+            case 1: plot_active = power_on; break;
+            case 2: plot_active = true; break;
+        }
+        if (plot_active && (loop_n%modulo==0)) {
             float x = loop_n * LOOP_PERIOD;
             commands_plot_set_graph(0);
             commands_send_plot_points(x, rpm_goal);
