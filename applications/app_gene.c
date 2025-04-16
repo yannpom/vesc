@@ -29,9 +29,9 @@
 #define LOOP_PERIOD 0.002f // 500 Hz
 #define LOOP_PERIOD_MS ((int)(1000*LOOP_PERIOD)) // 2 ms
 
-#define CAN_PERIOD 0.1f // 10 Hz
-#define CAN_PERIOD_MS ((int)(1000*CAN_PERIOD)) // 100 ms
-#define CAN_LOOP_RATIO (CAN_PERIOD_MS/LOOP_PERIOD_MS) // 50
+#define CAN_PERIOD 0.01f // 100 Hz
+#define CAN_PERIOD_MS ((int)(1000*CAN_PERIOD)) // 10 ms
+#define CAN_LOOP_RATIO (CAN_PERIOD_MS/LOOP_PERIOD_MS) // 5
 
 #define BAFANG_CADENCE_TO_ERPM_RATIO (10000.0f/60.0f)  // 10k ERPM at 60 RPM
 #define BAFANG_CADENCE_TO_ERPM(cadence) ((cadence)*BAFANG_CADENCE_TO_ERPM_RATIO)
@@ -84,6 +84,10 @@ static float watt = 0.0f;
 static float watt_filtered = 0.0f;
 static Biquad watt_filter1 = {};
 static Biquad watt_filter2 = {};
+
+static volatile float motors_rpm = 0;
+
+static volatile int loop_n[10] = {};
 
 typedef struct {
     char * name;
@@ -162,8 +166,8 @@ static THD_FUNCTION(my_thread, arg) {
     const app_configuration *conf = app_get_configuration();
     const int can_id = conf->controller_id;
 
-    int loop_n = 0;
     while (true) {
+        loop_n[1]++;
         // Check if it is time to stop.
         if (stop_now) {
             is_running = false;
@@ -171,8 +175,10 @@ static THD_FUNCTION(my_thread, arg) {
         }
         timeout_reset(); // Reset timeout if everything is OK.
 
+        loop_n[2]++;
+
         // RPM error
-        actual_rpm = BAFANG_ERPM_TO_CADENCE(mc_interface_get_rpm());
+        actual_rpm = BAFANG_ERPM_TO_CADENCE(fabsf(mc_interface_get_rpm()));
 
         e_rpm = actual_rpm - rpm_goal;
         
@@ -189,6 +195,8 @@ static THD_FUNCTION(my_thread, arg) {
 
         cmd_current = p_term + d_term_filtered + i_term;
         utils_truncate_number(&cmd_current, min_brake_current, max_brake_current);
+
+        loop_n[3]++;
 
         if (actual_rpm > rpm_on) {
             power_on = true;
@@ -211,10 +219,14 @@ static THD_FUNCTION(my_thread, arg) {
             rpm_goal = rpm_max;
         }
 
+        loop_n[4]++;
+
         // Drive motor
         if (power_on) {
             mc_interface_set_brake_current(cmd_current);
         }
+
+        loop_n[5]++;
 
         // Measure power
         current_bus = fabsf(mc_interface_get_tot_current_in_filtered());
@@ -222,6 +234,7 @@ static THD_FUNCTION(my_thread, arg) {
         watt = biquad_process(&watt_filter1, voltage_bus * current_bus);
         watt_filtered = biquad_process(&watt_filter2, watt);
 
+        loop_n[6]++;
 
         // Plot
         // if (power_on && (loop_n%10==0)) {
@@ -234,8 +247,8 @@ static THD_FUNCTION(my_thread, arg) {
             case 1: plot_active = power_on; break;
             case 2: plot_active = true; break;
         }
-        if (plot_active && (loop_n%modulo==0)) {
-            float x = loop_n * LOOP_PERIOD;
+        if (plot_active && (loop_n[0]%modulo==0)) {
+            float x = loop_n[0] * LOOP_PERIOD;
             commands_plot_set_graph(0);
             commands_send_plot_points(x, rpm_goal);
             commands_plot_set_graph(1);
@@ -262,21 +275,33 @@ static THD_FUNCTION(my_thread, arg) {
             
         }
 
+        loop_n[7]++;
         // CAN
-        if (loop_n % CAN_LOOP_RATIO == 0) {
-            int32_t send_index = 0;
-            uint8_t buffer[6];
-            buffer_append_int16(buffer, (int16_t)(10.0f*rpm_goal), &send_index);
-            buffer_append_int16(buffer, (int16_t)(10.0f*actual_rpm), &send_index);
-            buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
-            comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
-        
+        if (power_on && (loop_n[0] % CAN_LOOP_RATIO == 0)) { // 100 Hz
+            // int32_t send_index = 0;
+            // uint8_t buffer[6];
+            // buffer_append_int16(buffer, (int16_t)(10.0f*rpm_goal), &send_index);
+            // buffer_append_int16(buffer, (int16_t)(10.0f*actual_rpm), &send_index);
+            // buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
+            // comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
+
+            // comm_can_set_current_off_delay(255, cmd_current, 1.0f);
+            comm_can_set_current(255, cmd_current);
+
+            can_status_msg * status1 = comm_can_get_status_msg_id(1);
+            // can_status_msg * status2 = comm_can_get_status_msg_id(1);
+            if (status1) {
+                motors_rpm = status1->rpm;
+            }
         }
+
+        loop_n[8]++;
 
         // Sleep until the next scheduled time
         next_time += MS2ST(LOOP_PERIOD_MS);
-        chThdSleepUntil(next_time);
-        loop_n++;
+        // chThdSleepUntil(next_time);
+        chThdSleepMilliseconds(2);
+        loop_n[0]++;
     }
 }
 
@@ -287,6 +312,13 @@ static void terminal(int argc, const char **argv) {
         for (size_t i = 0; i < sizeof(PARAMETERS)/sizeof(param_t); i++) {
             commands_printf("  %s: %.3f", PARAMETERS[i].name, (double)*(PARAMETERS[i].value));
         }
+        commands_printf("loop_n: %d %d %d %d %d %d %d %d %d %d", loop_n[0], loop_n[1], loop_n[2], loop_n[3], loop_n[4], loop_n[5], loop_n[6], loop_n[7], loop_n[8], loop_n[9]);
+        commands_printf("is_running: %d", is_running);
+        commands_printf("stop_now: %d", stop_now);
+        commands_printf("motors_rpm: %d", motors_rpm);
+        
+        
+        
     } else if (argc == 3) {
         const char* param = argv[1];
         float value = atof(argv[2]);
