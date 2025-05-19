@@ -56,7 +56,7 @@ static volatile float rpm_off = 1.5f;
 static volatile float rpm_max = 100.0f;
 static volatile float rpm_mini = 30.0f;
 static volatile float min_brake_current = 0.1f;
-static volatile float max_brake_current = 10.0f;
+static volatile float max_brake_current = 20.0f;
 static volatile float pid_p = 0.8f; // Current / RPM
 static volatile float pid_i = 40.0f;
 static volatile float pid_d = 0.035f;
@@ -84,6 +84,8 @@ static float watt = 0.0f;
 static float watt_filtered = 0.0f;
 static Biquad watt_filter1 = {};
 static Biquad watt_filter2 = {};
+
+static Biquad rear_current_filter = {};
 
 static volatile float motors_rpm = 0;
 
@@ -125,6 +127,8 @@ void app_custom_start(void) {
 
     biquad_config(&watt_filter1, BQ_LOWPASS, LOOP_PERIOD*5.0f);
     biquad_config(&watt_filter2, BQ_LOWPASS, LOOP_PERIOD*0.25f);
+    biquad_config(&rear_current_filter, BQ_LOWPASS, LOOP_PERIOD*5.0f);
+    
 }
 
 // Called when the custom application is stopped. Stop our threads
@@ -201,8 +205,11 @@ static THD_FUNCTION(my_thread, arg) {
         if (actual_rpm > rpm_on) {
             power_on = true;
         } else if (power_on && actual_rpm < rpm_off) {
-            mc_interface_release_motor();
             power_on = false;
+        }
+
+        if (!power_on) {
+            mc_interface_release_motor();
         }
 
         // Compute the torques
@@ -233,6 +240,10 @@ static THD_FUNCTION(my_thread, arg) {
         voltage_bus = mc_interface_get_input_voltage_filtered();
         watt = biquad_process(&watt_filter1, voltage_bus * current_bus);
         watt_filtered = biquad_process(&watt_filter2, watt);
+
+        const float rear_current = fminf(120.0f, 2.0f*actual_rpm);
+        const float rear_current_filtered = biquad_process(&rear_current_filter, rear_current);
+
 
         loop_n[6]++;
 
@@ -286,13 +297,18 @@ static THD_FUNCTION(my_thread, arg) {
             // comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
 
             // comm_can_set_current_off_delay(255, cmd_current, 1.0f);
-            comm_can_set_current(255, cmd_current);
+            
+            // comm_can_set_current(255, rear_current_filtered);
 
-            can_status_msg * status1 = comm_can_get_status_msg_id(1);
+            // can_status_msg * status1 = comm_can_get_status_msg_id(1);
             // can_status_msg * status2 = comm_can_get_status_msg_id(1);
-            if (status1) {
-                motors_rpm = status1->rpm;
-            }
+            // if (status1) {
+            //     motors_rpm = status1->rpm;
+            // }
+        }
+
+        if (rear_current_filtered>1.0f && (loop_n[0] % CAN_LOOP_RATIO == 0)) { // 100 Hz
+            comm_can_set_current(255, rear_current_filtered);
         }
 
         loop_n[8]++;
