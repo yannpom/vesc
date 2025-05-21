@@ -61,8 +61,8 @@ static volatile float pid_p = 0.8f; // Current / RPM
 static volatile float pid_i = 40.0f;
 static volatile float pid_d = 0.035f;
 static volatile float d_filter_coeff = 0.2f;
-static volatile float inertia = 0.2f;
-static volatile float squared_losses_coeff = 2.0f; // A for 60 RPM
+static volatile float inertia = 0.25f;
+static volatile float squared_losses_coeff = 3.0f; // A for 60 RPM
 static volatile float plot_freq = 10.0f; // 10 Hz
 static volatile float plot_mode = 1;
 
@@ -87,7 +87,7 @@ static Biquad watt_filter2 = {};
 
 static Biquad rear_current_filter = {};
 
-static volatile float motors_rpm = 0;
+static volatile float motors_rpm = 0; // 8700 = 39km/h
 
 static volatile int loop_n[10] = {};
 
@@ -219,11 +219,20 @@ static THD_FUNCTION(my_thread, arg) {
         float net_torque = pedal_torque - friction_torque - air_resistance_torque;
 
         // Adjust the RPM goal
-        rpm_goal += net_torque * LOOP_PERIOD / inertia;
-        if (rpm_goal < rpm_mini) {
-            rpm_goal = rpm_mini;
-        } else if (rpm_goal > rpm_max) {
-            rpm_goal = rpm_max;
+        if (can_id == 1) {
+            float new_rpm_goal = motors_rpm / 8700.0f * 80.0f;
+            if (new_rpm_goal < rpm_mini) {
+                new_rpm_goal = rpm_mini;
+            }
+            // rpm_goal = fmaxf(new_rpm_goal, 4.0f);
+            rpm_goal = 0.97f * rpm_goal + 0.03f * new_rpm_goal;
+        } else {
+            rpm_goal += net_torque * LOOP_PERIOD / inertia;
+            if (rpm_goal < rpm_mini) {
+                rpm_goal = rpm_mini;
+            } else if (rpm_goal > rpm_max) {
+                rpm_goal = rpm_max;
+            }
         }
 
         loop_n[4]++;
@@ -241,7 +250,7 @@ static THD_FUNCTION(my_thread, arg) {
         watt = biquad_process(&watt_filter1, voltage_bus * current_bus);
         watt_filtered = biquad_process(&watt_filter2, watt);
 
-        const float rear_current = fminf(120.0f, 2.0f*actual_rpm);
+        const float rear_current = fminf(120.0f, 12.0f*(cmd_current-min_brake_current));
         const float rear_current_filtered = biquad_process(&rear_current_filter, rear_current);
 
 
@@ -289,26 +298,30 @@ static THD_FUNCTION(my_thread, arg) {
         loop_n[7]++;
         // CAN
         if (power_on && (loop_n[0] % CAN_LOOP_RATIO == 0)) { // 100 Hz
-            // int32_t send_index = 0;
-            // uint8_t buffer[6];
-            // buffer_append_int16(buffer, (int16_t)(10.0f*rpm_goal), &send_index);
-            // buffer_append_int16(buffer, (int16_t)(10.0f*actual_rpm), &send_index);
-            // buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
-            // comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
+            int32_t send_index = 0;
+            uint8_t buffer[6];
+            buffer_append_int16(buffer, (int16_t)(10.0f*rpm_goal), &send_index);
+            buffer_append_int16(buffer, (int16_t)(10.0f*actual_rpm), &send_index);
+            buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
+            comm_can_transmit_eid_replace(can_id | ((uint32_t)CAN_PACKET_GENE << 8), buffer, send_index, true, 0);
 
             // comm_can_set_current_off_delay(255, cmd_current, 1.0f);
             
-            // comm_can_set_current(255, rear_current_filtered);
-
-            // can_status_msg * status1 = comm_can_get_status_msg_id(1);
-            // can_status_msg * status2 = comm_can_get_status_msg_id(1);
-            // if (status1) {
-            //     motors_rpm = status1->rpm;
-            // }
+            // comm_can_set_current(255, rear_current_filtered);   
         }
 
-        if (rear_current_filtered>1.0f && (loop_n[0] % CAN_LOOP_RATIO == 0)) { // 100 Hz
-            comm_can_set_current(255, rear_current_filtered);
+        can_status_msg * status1 = comm_can_get_status_msg_id(5);
+        // can_status_msg * status2 = comm_can_get_status_msg_id(6);
+        if (status1) {
+            motors_rpm = status1->rpm;
+
+        }
+
+        if (can_id == 1) {
+            if (rear_current_filtered>1.0f && (loop_n[0] % CAN_LOOP_RATIO == 0)) { // 100 Hz
+                comm_can_set_current(5, rear_current_filtered);
+                comm_can_set_current(6, rear_current_filtered);
+            }
         }
 
         loop_n[8]++;
@@ -331,7 +344,8 @@ static void terminal(int argc, const char **argv) {
         commands_printf("loop_n: %d %d %d %d %d %d %d %d %d %d", loop_n[0], loop_n[1], loop_n[2], loop_n[3], loop_n[4], loop_n[5], loop_n[6], loop_n[7], loop_n[8], loop_n[9]);
         commands_printf("is_running: %d", is_running);
         commands_printf("stop_now: %d", stop_now);
-        commands_printf("motors_rpm: %d", motors_rpm);
+        commands_printf("motors_rpm: %f", (double)motors_rpm);
+        // commands_printf("motors_id: %d", (double)id);
         
         
         

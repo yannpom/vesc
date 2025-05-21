@@ -24,7 +24,7 @@
 #include "hal.h"
 
 // Settings
-#define CAN_STATUS_MSGS_TO_STORE	10
+#define CAN_STATUS_MSGS_TO_STORE	30
 
 // Functions
 void comm_can_init(void);
