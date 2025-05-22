@@ -271,12 +271,11 @@ static THD_FUNCTION(gene_thread, arg) {
         float net_torque = pedal_torque - friction_torque - air_resistance_torque;
 
         // Adjust the RPM goal
-        if (can_id == 1) {
+        if (can_id == 1 && mode > 0) {
             float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 8700.0f * 80.0f;
             if (new_rpm_goal < rpm_mini) {
                 new_rpm_goal = rpm_mini;
             }
-            // rpm_goal = fmaxf(new_rpm_goal, 4.0f);
             rpm_goal = 0.97f * rpm_goal + 0.03f * new_rpm_goal;
         } else {
             rpm_goal += net_torque * LOOP_PERIOD / inertia;
@@ -438,6 +437,7 @@ static THD_FUNCTION(gene_can_thread, arg) {
 
     const int can_period_ms = can_id == 1 ? CAN_PERIOD_MS : 1000;
 
+    int i = 0;
     while (true) {
         // Check if it is time to stop.
         if (stop_now) {
@@ -445,7 +445,20 @@ static THD_FUNCTION(gene_can_thread, arg) {
             return;
         }
     
-        if (rear_current_filtered>.01f || power_on) {
+        bool send_frame = false;
+        if (can_id == 1) {
+            if (power_on || rear_current_filtered>.01f) {
+                send_frame = true;
+            } else {
+                // avoid flooding when power_off
+                send_frame = i%20==0;
+            }
+        } else {
+            send_frame = true;
+        }
+            
+        
+        if (send_frame) {
             int32_t send_index = 0;
             uint8_t buffer[8];
 
@@ -472,6 +485,7 @@ static THD_FUNCTION(gene_can_thread, arg) {
         } while (next_time <= chVTGetSystemTimeX());
         
         chThdSleepUntil(next_time);
+        i++;
     }
 }
 
