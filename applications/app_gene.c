@@ -189,6 +189,9 @@ void app_custom_configure(app_configuration *conf) {
 
 static THD_FUNCTION(motor_thread, arg) {
     (void)arg;
+
+    chRegSetThreadName("APP_MOTOR");
+
     while (true) {
         if (stop_now) {
             return;
@@ -196,6 +199,8 @@ static THD_FUNCTION(motor_thread, arg) {
 
         motor_current_filtered = 0.03 * motor_current + 0.97 * motor_current_filtered;
         mc_interface_set_current(motor_current_filtered);
+
+
 
         timeout_reset();
         chThdSleepMilliseconds(1);
@@ -440,7 +445,7 @@ static THD_FUNCTION(gene_can_thread, arg) {
             return;
         }
     
-        if (rear_current_filtered>.1f || power_on) {
+        if (rear_current_filtered>.01f || power_on) {
             int32_t send_index = 0;
             uint8_t buffer[8];
 
@@ -454,10 +459,9 @@ static THD_FUNCTION(gene_can_thread, arg) {
             buffer_append_int16(buffer, (int16_t)(100.0f*current_to_send), &send_index);
             buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
             buffer_append_int16(buffer, (int16_t)(100.0f*actual_rpm), &send_index);
-            can_bitfield bitfield = {
-                .reverse = 0,
-                .brake = 0,
-            };
+            can_bitfield bitfield = {};
+            bitfield.reverse = 0;
+            bitfield.brake = 0;
             buffer_append_int8(buffer, bitfield.value, &send_index);
             comm_can_transmit_sid(0x30 | can_id, buffer, send_index);
         }
