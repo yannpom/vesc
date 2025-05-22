@@ -21,6 +21,14 @@
 #include <math.h>
 #include <stdbool.h>
 
+void buffer_append_int8(uint8_t* buffer, int8_t number, int32_t *index) {
+	buffer[(*index)++] = number;
+}
+
+void buffer_append_uint8(uint8_t* buffer, uint8_t number, int32_t *index) {
+	buffer[(*index)++] = number;
+}
+
 void buffer_append_int16(uint8_t* buffer, int16_t number, int32_t *index) {
 	buffer[(*index)++] = number >> 8;
 	buffer[(*index)++] = number;
@@ -150,6 +158,18 @@ void buffer_append_float64_auto(uint8_t* buffer, double number, int32_t *index) 
 	float err = (float)(number - (double)n);
 	buffer_append_float32_auto(buffer, n, index);
 	buffer_append_float32_auto(buffer, err, index);
+}
+
+int8_t buffer_get_int8(const uint8_t *buffer, int32_t *index) {
+	int8_t res = buffer[*index];
+	*index += 1;
+	return res;
+}
+
+uint8_t buffer_get_uint8(const uint8_t *buffer, int32_t *index) {
+	uint8_t res = buffer[*index];
+	*index += 1;
+	return res;
 }
 
 int16_t buffer_get_int16(const uint8_t *buffer, int32_t *index) {
