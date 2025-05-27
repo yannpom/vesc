@@ -96,6 +96,7 @@ static volatile float rpm_max = 100.0f;
 static volatile float rpm_mini = 30.0f;
 static volatile float min_brake_current = 0.1f;
 static volatile float max_brake_current = 20.0f;
+static volatile float current_gain = 10.00f;
 static volatile float pid_p = 0.8f; // Current / RPM
 static volatile float pid_i = 40.0f;
 static volatile float pid_d = 0.035f;
@@ -155,6 +156,7 @@ static param_t PARAMETERS[] = {
     {"df", &d_filter_coeff, "Derivative filter coefficient"},
     {"Cmin", &min_brake_current, "Minimum current (A)"},
     {"Cmax", &max_brake_current, "Maximum current (A)"},
+    {"gain", &current_gain, "Drive current gain (A/A)"},
     {"ron", &rpm_on, "RPM to turn on"},
     {"roff", &rpm_off, "RPM to turn off"},
     {"rmax", &rpm_max, "Maximum RPM"},
@@ -174,7 +176,7 @@ void app_custom_start(void) {
 
     biquad_config(&watt_filter1, BQ_LOWPASS, LOOP_PERIOD * 5.0f);
     biquad_config(&watt_filter2, BQ_LOWPASS, LOOP_PERIOD * 0.25f);
-    biquad_config(&rear_current_filter, BQ_LOWPASS, LOOP_PERIOD * 5.0f);
+    biquad_config(&rear_current_filter, BQ_LOWPASS, LOOP_PERIOD * 2.5f);
 
     const app_configuration *conf = app_get_configuration();
     can_id = conf->controller_id;
@@ -355,7 +357,7 @@ static THD_FUNCTION(gene_thread, arg) {
         watt = biquad_process(&watt_filter1, voltage_bus * current_bus);
         watt_filtered = biquad_process(&watt_filter2, watt);
 
-        rear_current = 12.0f*(cmd_current-min_brake_current);
+        rear_current = current_gain*(cmd_current-min_brake_current);
         rear_current_filtered = biquad_process(&rear_current_filter, rear_current);
 
         // TODO mode to another thread
@@ -421,8 +423,8 @@ static bool can_sid_callback(uint32_t id, uint8_t *data, uint8_t len) {
     } else if (id == 0x27) { // outputs
         memcpy(&state_can, data, sizeof(state_can));
         switch (state_can.brake_level) {
-            case 1: motor_brake_current_goal = 16.0f; break;
-            case 2: motor_brake_current_goal = 40.0f; break;
+            case 1: motor_brake_current_goal = 32.0f; break;
+            case 2: motor_brake_current_goal = 80.0f; break;
             default: motor_brake_current_goal = 0;
         }
     }
