@@ -55,6 +55,21 @@ typedef struct {
 #pragma pack(pop)
 
 
+#pragma pack(push, 1)
+typedef struct {
+    int power_on : 1;
+    int blinker_left : 1;
+    int blinker_right : 1;
+    int horn : 1;
+    int interior_light : 1;
+    int wiper : 1;
+    int brake_level: 2;
+} state_can_t;
+#pragma pack(pop)
+
+state_can_t state_can = {};
+
+
 // Threads
 static THD_WORKING_AREA(main_thread_wa, 1024);
 static THD_WORKING_AREA(can_thread_wa, 1024);
@@ -66,7 +81,8 @@ static THD_FUNCTION(motor_can_thread, arg);
 
 
 // Private functions
-static void terminal(int argc, const char **argv);
+static void terminal_gene(int argc, const char **argv);
+static void terminal_motor(int argc, const char **argv);
 
 // Private variables
 static volatile bool stop_now = true;
@@ -116,10 +132,15 @@ static Biquad watt_filter2 = {};
 static Biquad rear_current_filter = {};
 
 static volatile float motors_rpm[2] = {}; // 8700 = 39km/h
-static volatile int loop_n[10] = {};
+static volatile int gene_thread_loop_n = 0;
 
-static volatile float motor_current = 0.0f;
-static volatile float motor_current_filtered = 0.0f;
+
+// Motor stuff
+static volatile float motor_driving_current_goal = 0.0f; // Current from Gene input
+static volatile int motor_driving_current_goal_age = 0; // age of the command
+static volatile float motor_brake_current_goal = 0.0f; // Current from brakes input
+static volatile float motor_driving_current = 0.0f; // Actual current goal (brake has precedence over gene)
+static volatile float motor_braking_current = 0.0f;
 
 typedef struct {
     char * name;
@@ -162,12 +183,12 @@ void app_custom_start(void) {
         // Gene
         chThdCreateStatic(main_thread_wa, sizeof(main_thread_wa), NORMALPRIO+10, gene_thread, NULL);
         chThdCreateStatic(can_thread_wa, sizeof(can_thread_wa), NORMALPRIO, gene_can_thread, NULL);
-        // Terminal commands for the VESC Tool terminal can be registered.
-        terminal_register_command_callback("gene", "Print the Gene parameters", 0, terminal);
+        terminal_register_command_callback("gene", "Print the Gene parameters", 0, terminal_gene);
     } else if (can_id == 5 || can_id == 6) {
         // Motors
         chThdCreateStatic(main_thread_wa, sizeof(main_thread_wa), NORMALPRIO+10, motor_thread, NULL);
         chThdCreateStatic(can_thread_wa, sizeof(can_thread_wa), NORMALPRIO, motor_can_thread, NULL);
+        terminal_register_command_callback("motor", "Print the Motor parameters", 0, terminal_motor);
     }
 }
 
@@ -175,7 +196,8 @@ void app_custom_start(void) {
 // and release callbacks.
 void app_custom_stop(void) {
     mc_interface_set_pwm_callback(0);
-    terminal_unregister_callback(terminal);
+    terminal_unregister_callback(terminal_gene);
+    terminal_unregister_callback(terminal_motor);
 
     stop_now = true;
     while (thread_main_is_running || thread_can_is_running) {
@@ -187,6 +209,13 @@ void app_custom_configure(app_configuration *conf) {
     (void)conf;
 }
 
+inline void limit_rate(float * value, float target, float max_rate) {
+    float diff = target - *value;
+    diff = TRUNC_MIN_MAX(diff, -max_rate, max_rate);
+    *value += diff;
+}
+
+
 static THD_FUNCTION(motor_thread, arg) {
     (void)arg;
 
@@ -197,11 +226,40 @@ static THD_FUNCTION(motor_thread, arg) {
             return;
         }
 
-        motor_current_filtered = 0.03 * motor_current + 0.97 * motor_current_filtered;
-        mc_interface_set_current(motor_current_filtered);
+        motor_driving_current_goal_age++;
+        if (motor_driving_current_goal_age > 200) {
+            motor_driving_current_goal = 0;
+        }
 
+        if (motor_brake_current_goal > 0) {
+            if (fabsf(motor_driving_current) > 1.0f) {
+                // we are driving, we need to decrease current before braking
+                limit_rate(&motor_driving_current, 0, 1.0f);
+                motor_braking_current = 0;
+            } else {
+                // driving current is null, start increase the brake current
+                limit_rate(&motor_braking_current, motor_brake_current_goal, 1.0f);
+                motor_driving_current = 0;
+            }
+        } else {
+            // driving wanted
+            if (motor_braking_current > 1.0f) {
+                // but we are currenctly braking
+                limit_rate(&motor_braking_current, 0, 1.0f);
+                motor_driving_current = 0;
+            } else {
+                // no braking ongoing
+                limit_rate(&motor_driving_current, motor_driving_current_goal, 1.0f);
+                motor_braking_current = 0;
+            }
+        }
 
-
+        if (motor_braking_current) {
+            mc_interface_set_brake_current(motor_braking_current);
+        } else {
+            mc_interface_set_current(motor_driving_current);
+        }
+        
         timeout_reset();
         chThdSleepMilliseconds(1);
     }
@@ -272,7 +330,7 @@ static THD_FUNCTION(gene_thread, arg) {
 
         // Adjust the RPM goal
         if (can_id == 1 && mode > 0) {
-            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 8700.0f * 80.0f;
+            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 5500.0f * 80.0f;
             if (new_rpm_goal < rpm_mini) {
                 new_rpm_goal = rpm_mini;
             }
@@ -302,26 +360,26 @@ static THD_FUNCTION(gene_thread, arg) {
 
         // TODO mode to another thread
         // Plot
-        const int modulo = 1.0f/(LOOP_PERIOD*plot_freq);
-        bool plot_active = false;
-        switch ((int)plot_mode)
-        {
-            case 1: plot_active = power_on; break;
-            case 2: plot_active = true; break;
-        }
-        if (plot_active && (loop_n[0]%modulo==0)) {
-            float x = loop_n[0] * LOOP_PERIOD;
-            commands_plot_set_graph(0);
-            commands_send_plot_points(x, rpm_goal);
-            commands_plot_set_graph(1);
-            commands_send_plot_points(x, actual_rpm);
-            commands_plot_set_graph(2);
-            commands_send_plot_points(x, cmd_current);
-            commands_plot_set_graph(3);
-            commands_send_plot_points(x, watt);
-            commands_plot_set_graph(4);
-            commands_send_plot_points(x, watt_filtered);
-        }
+        // const int modulo = 1.0f/(LOOP_PERIOD*plot_freq);
+        // bool plot_active = false;
+        // switch ((int)plot_mode)
+        // {
+        //     case 1: plot_active = power_on; break;
+        //     case 2: plot_active = true; break;
+        // }
+        // if (plot_active && (loop_n[0]%modulo==0)) {
+        //     float x = loop_n[0] * LOOP_PERIOD;
+        //     commands_plot_set_graph(0);
+        //     commands_send_plot_points(x, rpm_goal);
+        //     commands_plot_set_graph(1);
+        //     commands_send_plot_points(x, actual_rpm);
+        //     commands_plot_set_graph(2);
+        //     commands_send_plot_points(x, cmd_current);
+        //     commands_plot_set_graph(3);
+        //     commands_send_plot_points(x, watt);
+        //     commands_plot_set_graph(4);
+        //     commands_send_plot_points(x, watt_filtered);
+        // }
 
         // Sleep until the next scheduled time
         do {
@@ -329,7 +387,7 @@ static THD_FUNCTION(gene_thread, arg) {
         } while (next_time <= chVTGetSystemTimeX());
         
         chThdSleepUntil(next_time);
-        loop_n[0]++;
+        gene_thread_loop_n++;
     }
 }
 
@@ -356,8 +414,17 @@ static bool can_sid_callback(uint32_t id, uint8_t *data, uint8_t len) {
         buffer_get_int16(data, &index);
         can_bitfield bitfield;
         bitfield.value = buffer_get_int8(data, &index);
-
-        motor_current = bitfield.reverse ? -current : current;   
+        //bitfield.brake
+        // motor_current = bitfield.reverse ? -current : current;
+        motor_driving_current_goal = current;
+        motor_driving_current_goal_age = 0;
+    } else if (id == 0x27) { // outputs
+        memcpy(&state_can, data, sizeof(state_can));
+        switch (state_can.brake_level) {
+            case 1: motor_brake_current_goal = 16.0f; break;
+            case 2: motor_brake_current_goal = 40.0f; break;
+            default: motor_brake_current_goal = 0;
+        }
     }
     return true;
 }
@@ -491,13 +558,13 @@ static THD_FUNCTION(gene_can_thread, arg) {
 
 
 // Callback function for the terminal command with arguments.
-static void terminal(int argc, const char **argv) {
+static void terminal_gene(int argc, const char **argv) {
     if (argc == 1) {
         commands_printf("Gene parameters:");
         for (size_t i = 0; i < sizeof(PARAMETERS)/sizeof(param_t); i++) {
             commands_printf("  %s: %.3f", PARAMETERS[i].name, (double)*(PARAMETERS[i].value));
         }
-        commands_printf("loop_n: %d %d %d %d %d %d %d %d %d %d", loop_n[0], loop_n[1], loop_n[2], loop_n[3], loop_n[4], loop_n[5], loop_n[6], loop_n[7], loop_n[8], loop_n[9]);
+        commands_printf("gene_thread_loop_n: %d", gene_thread_loop_n);
         commands_printf("is_running: %d %d", thread_main_is_running, thread_can_is_running);
         commands_printf("stop_now: %d", stop_now);
     } else if (argc == 3) {
@@ -515,4 +582,13 @@ static void terminal(int argc, const char **argv) {
     } else {
         commands_printf("Usage: gene [param] [value]");
     }
+}
+
+static void terminal_motor(int argc, const char **argv) {
+    commands_printf("motor_brake_current_goal %.3f", motor_brake_current_goal);
+    commands_printf("motor_braking_current %.3f", motor_braking_current);
+    commands_printf("motor_driving_current_goal %.3f", motor_driving_current_goal);
+    commands_printf("motor_driving_current %.3f", motor_driving_current);
+    commands_printf("motor_driving_current_goal_age %d", motor_driving_current_goal_age);
+
 }
