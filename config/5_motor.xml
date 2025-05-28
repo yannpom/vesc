@@ -54,7 +54,7 @@
     <hall_sl_erpm>2000</hall_sl_erpm>
     <foc_current_kp>0.1877</foc_current_kp>
     <foc_current_ki>48.24</foc_current_ki>
-    <foc_f_zv>34000</foc_f_zv>
+    <foc_f_zv>30000</foc_f_zv>
     <foc_dt_us>0.12</foc_dt_us>
     <foc_encoder_inverted>0</foc_encoder_inverted>
     <foc_encoder_offset>180</foc_encoder_offset>
@@ -66,7 +66,7 @@
     <foc_motor_ld_lq_diff>6.808e-05</foc_motor_ld_lq_diff>
     <foc_motor_r>0.0965</foc_motor_r>
     <foc_motor_flux_linkage>0.03874</foc_motor_flux_linkage>
-    <foc_observer_gain>1.2e+06</foc_observer_gain>
+    <foc_observer_gain>600000</foc_observer_gain>
     <foc_observer_gain_slow>0.05</foc_observer_gain_slow>
     <foc_observer_offset>-1</foc_observer_offset>
     <foc_duty_dowmramp_kp>50</foc_duty_dowmramp_kp>
