@@ -47,8 +47,8 @@ typedef struct {
     union {
         uint8_t value;
         struct {
-            int walk:1; // 0 = drive, 1 = walk
-            int brake:1; // 0 = drive, 1 = brake
+            unsigned walk:1; // 0 = drive, 1 = walk
+            unsigned brake:1; // 0 = drive, 1 = brake
         };
     };
 } can_bitfield;
@@ -57,16 +57,16 @@ typedef struct {
 
 #pragma pack(push, 1)
 typedef struct {
-    int power_on : 1;
-    int blinker_left : 1;
-    int blinker_right : 1;
-    int horn : 1;
-    int interior_light : 1;
-    int wiper : 1;
-    int brake_level: 2;
-    int walk_forward: 1;
-    int walk_backward: 1;
-    int padding : 6;
+    unsigned power_on : 1;
+    unsigned blinker_left : 1;
+    unsigned blinker_right : 1;
+    unsigned horn : 1;
+    unsigned interior_light : 1;
+    unsigned wiper : 1;
+    unsigned brake_level: 2;
+    unsigned walk_forward: 1;
+    unsigned walk_backward: 1;
+    unsigned padding : 6;
 } state_can_t;
 #pragma pack(pop)
 
@@ -113,7 +113,7 @@ static volatile float walk_speed_rpm = 600.0f;
 static uint8_t can_id = 0;
 
 // Live data
-static volatile uint8_t mode = 0; // 0=neutral, 1=forward, 2=reverse
+static volatile uint8_t mode = 0; // 0=neutral, 1=forward, 2=reverse, 3=walk
 static volatile float actual_rpm = 0.0f;
 static volatile float rpm_goal = 0.0f;
 static volatile float e_rpm = 0.0f;
@@ -147,7 +147,6 @@ static volatile float motor_brake_current_goal = 0.0f; // Current from brakes in
 static volatile float motor_driving_current = 0.0f; // Actual current goal (brake has precedence over gene)
 static volatile float motor_braking_current = 0.0f;
 static volatile float motor_walk_direction = 0.0f;
-// static volatile float motor_rpm_acceleration
 
 typedef struct {
     char * name;
@@ -181,7 +180,7 @@ void app_custom_start(void) {
     stop_now = false;
 
     biquad_config(&watt_filter1, BQ_LOWPASS, LOOP_PERIOD * 5.0f);
-    biquad_config(&watt_filter2, BQ_LOWPASS, LOOP_PERIOD * 0.25f);
+    biquad_config(&watt_filter2, BQ_LOWPASS, LOOP_PERIOD * 1.0f);
     biquad_config(&rear_current_filter, BQ_LOWPASS, LOOP_PERIOD * 2.5f);
 
     const app_configuration *conf = app_get_configuration();
@@ -234,11 +233,14 @@ static THD_FUNCTION(motor_thread, arg) {
             return;
         }
 
+        
+
         motor_driving_current_goal_age++;
         if (motor_driving_current_goal_age > 200) {
             motor_driving_current_goal = 0;
         }
 
+    
         if (motor_brake_current_goal > 0) {
             if (fabsf(motor_driving_current) > 1.0f) {
                 // we are driving, we need to decrease current before braking
@@ -262,20 +264,24 @@ static THD_FUNCTION(motor_thread, arg) {
             }
         }
 
-        if (motor_walk_direction != 0.0f) {
-            if (motor_walk_direction > 0) {
-                mc_interface_set_pid_speed(walk_speed_rpm);
-            } else {
-                mc_interface_set_pid_speed(-walk_speed_rpm);
-            }
-        }
-        
 
-        if (motor_braking_current) {
-            mc_interface_set_brake_current(motor_braking_current);
-        } else {
-            mc_interface_set_current(motor_driving_current);
-        }
+        if (mode == 1 || mode == 2) {
+            if (motor_braking_current) {
+                mc_interface_set_brake_current(motor_braking_current);
+            } else {
+                mc_interface_set_current(motor_driving_current);
+            }
+        } else if (mode == 3) {
+            if (motor_walk_direction != 0.0f) {
+                if (motor_walk_direction > 0) {
+                    mc_interface_set_pid_speed(walk_speed_rpm);
+                } else {
+                    mc_interface_set_pid_speed(-walk_speed_rpm);
+                }
+            } else {
+                mc_interface_set_current(0);
+            }
+        }        
         
         timeout_reset();
         chThdSleepMilliseconds(1);
@@ -433,26 +439,32 @@ static bool can_sid_callback(uint32_t id, uint8_t *data, uint8_t len) {
         bitfield.value = buffer_get_int8(data, &index);
         // bitfield.brake
         // bitfield.walk
-        if (bitfield.brake) {
-            motor_brake_current_goal = current;
+        if (state_can.brake_level > 0) {
             motor_driving_current_goal = 0;
         } else {
             motor_driving_current_goal = current;
             motor_driving_current_goal_age = 0;
             motor_brake_current_goal = 0;
         }
-        if (bitfield.walk) {
-            motor_driving_current_goal = current
-            motor_driving_current_goal_age = 0;
-        }
         
     } else if (id == 0x27) { // outputs
         memcpy(&state_can, data, sizeof(state_can));
-        // switch (state_can.brake_level) {
-        //     case 1: motor_brake_current_goal = 32.0f; break;
-        //     case 2: motor_brake_current_goal = 80.0f; break;
-        //     default: motor_brake_current_goal = 0;
-        // }
+        if (state_can.walk_forward) {
+            motor_walk_direction = 1.0f;
+        } else if (state_can.walk_backward) {
+            motor_walk_direction = -1.0f;
+        } else {
+            motor_walk_direction = 0.0f;
+        }
+        if (state_can.brake_level == 1) {
+            motor_brake_current_goal = 25.0f;
+            motor_driving_current_goal = 0;
+        } else if (state_can.brake_level == 2) {
+            motor_brake_current_goal = 60.0f;
+            motor_driving_current_goal = 0;
+        } else {
+            motor_brake_current_goal = 0;
+        }
     }
     return true;
 }
@@ -561,16 +573,14 @@ static THD_FUNCTION(gene_can_thread, arg) {
             switch (mode) {
                 case 1: current_to_send = rear_current_filtered; break;
                 case 2: current_to_send = -rear_current_filtered; break;
+                case 3: current_to_send = 0; break;
             }
             current_to_send = TRUNC_MIN_MAX(current_to_send, -120.0f, 120.0f);
             buffer_append_int16(buffer, (int16_t)(100.0f*current_to_send), &send_index);
             buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
             buffer_append_int16(buffer, (int16_t)(100.0f*actual_rpm), &send_index);
             can_bitfield bitfield = {};
-
-            bitfield.reverse = 0;
-            bitfield.brake = 0;
-
+            // bitfield.brake = 0;
             buffer_append_int8(buffer, bitfield.value, &send_index);
             comm_can_transmit_sid(0x30 | can_id, buffer, send_index);
         }
@@ -614,10 +624,13 @@ static void terminal_gene(int argc, const char **argv) {
 }
 
 static void terminal_motor(int argc, const char **argv) {
+    commands_printf("mode %d", mode);
+    commands_printf("state_can.brake_level %d", state_can.brake_level);
     commands_printf("motor_brake_current_goal %.3f", motor_brake_current_goal);
     commands_printf("motor_braking_current %.3f", motor_braking_current);
     commands_printf("motor_driving_current_goal %.3f", motor_driving_current_goal);
     commands_printf("motor_driving_current %.3f", motor_driving_current);
     commands_printf("motor_driving_current_goal_age %d", motor_driving_current_goal_age);
+    commands_printf("motor_walk_direction %.3f", motor_walk_direction);
 
 }
