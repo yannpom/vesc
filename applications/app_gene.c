@@ -47,8 +47,8 @@ typedef struct {
     union {
         uint8_t value;
         struct {
-            int reverse:1;
-            int brake:1;
+            int walk:1; // 0 = drive, 1 = walk
+            int brake:1; // 0 = drive, 1 = brake
         };
     };
 } can_bitfield;
@@ -64,6 +64,9 @@ typedef struct {
     int interior_light : 1;
     int wiper : 1;
     int brake_level: 2;
+    int walk_forward: 1;
+    int walk_backward: 1;
+    int padding : 6;
 } state_can_t;
 #pragma pack(pop)
 
@@ -105,6 +108,7 @@ static volatile float inertia = 0.25f;
 static volatile float squared_losses_coeff = 3.0f; // A for 60 RPM
 static volatile float plot_freq = 10.0f; // 10 Hz
 static volatile float plot_mode = 0;
+static volatile float walk_speed_rpm = 600.0f;
 
 static uint8_t can_id = 0;
 
@@ -142,6 +146,8 @@ static volatile int motor_driving_current_goal_age = 0; // age of the command
 static volatile float motor_brake_current_goal = 0.0f; // Current from brakes input
 static volatile float motor_driving_current = 0.0f; // Actual current goal (brake has precedence over gene)
 static volatile float motor_braking_current = 0.0f;
+static volatile float motor_walk_direction = 0.0f;
+// static volatile float motor_rpm_acceleration
 
 typedef struct {
     char * name;
@@ -255,6 +261,15 @@ static THD_FUNCTION(motor_thread, arg) {
                 motor_braking_current = 0;
             }
         }
+
+        if (motor_walk_direction != 0.0f) {
+            if (motor_walk_direction > 0) {
+                mc_interface_set_pid_speed(walk_speed_rpm);
+            } else {
+                mc_interface_set_pid_speed(-walk_speed_rpm);
+            }
+        }
+        
 
         if (motor_braking_current) {
             mc_interface_set_brake_current(motor_braking_current);
@@ -416,17 +431,28 @@ static bool can_sid_callback(uint32_t id, uint8_t *data, uint8_t len) {
         buffer_get_int16(data, &index);
         can_bitfield bitfield;
         bitfield.value = buffer_get_int8(data, &index);
-        //bitfield.brake
-        // motor_current = bitfield.reverse ? -current : current;
-        motor_driving_current_goal = current;
-        motor_driving_current_goal_age = 0;
+        // bitfield.brake
+        // bitfield.walk
+        if (bitfield.brake) {
+            motor_brake_current_goal = current;
+            motor_driving_current_goal = 0;
+        } else {
+            motor_driving_current_goal = current;
+            motor_driving_current_goal_age = 0;
+            motor_brake_current_goal = 0;
+        }
+        if (bitfield.walk) {
+            motor_driving_current_goal = current
+            motor_driving_current_goal_age = 0;
+        }
+        
     } else if (id == 0x27) { // outputs
         memcpy(&state_can, data, sizeof(state_can));
-        switch (state_can.brake_level) {
-            case 1: motor_brake_current_goal = 32.0f; break;
-            case 2: motor_brake_current_goal = 80.0f; break;
-            default: motor_brake_current_goal = 0;
-        }
+        // switch (state_can.brake_level) {
+        //     case 1: motor_brake_current_goal = 32.0f; break;
+        //     case 2: motor_brake_current_goal = 80.0f; break;
+        //     default: motor_brake_current_goal = 0;
+        // }
     }
     return true;
 }
@@ -533,7 +559,6 @@ static THD_FUNCTION(gene_can_thread, arg) {
 
             float current_to_send = 0;
             switch (mode) {
-                case 0: break;
                 case 1: current_to_send = rear_current_filtered; break;
                 case 2: current_to_send = -rear_current_filtered; break;
             }
@@ -542,8 +567,10 @@ static THD_FUNCTION(gene_can_thread, arg) {
             buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
             buffer_append_int16(buffer, (int16_t)(100.0f*actual_rpm), &send_index);
             can_bitfield bitfield = {};
+
             bitfield.reverse = 0;
             bitfield.brake = 0;
+
             buffer_append_int8(buffer, bitfield.value, &send_index);
             comm_can_transmit_sid(0x30 | can_id, buffer, send_index);
         }
