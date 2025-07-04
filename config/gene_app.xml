@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <APPConfiguration>
     <ConfigVersion>2</ConfigVersion>
-    <controller_id>2</controller_id>
+    <controller_id>1</controller_id>
     <timeout_msec>1000</timeout_msec>
     <timeout_brake_current>0</timeout_brake_current>
     <can_status_rate_1>50</can_status_rate_1>

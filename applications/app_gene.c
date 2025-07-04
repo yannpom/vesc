@@ -353,7 +353,7 @@ static THD_FUNCTION(gene_thread, arg) {
 
         // Adjust the RPM goal
         if (can_id == 1 && mode > 0) {
-            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 5500.0f * 80.0f;
+            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 5500.0f * 62.0f;
             if (new_rpm_goal < rpm_mini) {
                 new_rpm_goal = rpm_mini;
             }
