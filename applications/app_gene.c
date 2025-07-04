@@ -99,7 +99,7 @@ static volatile float rpm_max = 100.0f;
 static volatile float rpm_mini = 30.0f;
 static volatile float min_brake_current = 0.1f;
 static volatile float max_brake_current = 20.0f;
-static volatile float current_gain = 10.00f;
+static volatile float current_gain = 22.00f;
 static volatile float pid_p = 0.8f; // Current / RPM
 static volatile float pid_i = 40.0f;
 static volatile float pid_d = 0.035f;
@@ -457,10 +457,10 @@ static bool can_sid_callback(uint32_t id, uint8_t *data, uint8_t len) {
             motor_walk_direction = 0.0f;
         }
         if (state_can.brake_level == 1) {
-            motor_brake_current_goal = 25.0f;
+            motor_brake_current_goal = 50.0f;
             motor_driving_current_goal = 0;
         } else if (state_can.brake_level == 2) {
-            motor_brake_current_goal = 60.0f;
+            motor_brake_current_goal = 120.0f;
             motor_driving_current_goal = 0;
         } else {
             motor_brake_current_goal = 0;
@@ -575,7 +575,7 @@ static THD_FUNCTION(gene_can_thread, arg) {
                 case 2: current_to_send = -rear_current_filtered; break;
                 case 3: current_to_send = 0; break;
             }
-            current_to_send = TRUNC_MIN_MAX(current_to_send, -120.0f, 120.0f);
+            current_to_send = TRUNC_MIN_MAX(current_to_send, -300.0f, 300.0f);
             buffer_append_int16(buffer, (int16_t)(100.0f*current_to_send), &send_index);
             buffer_append_int16(buffer, (int16_t)(10.0f*watt_filtered), &send_index);
             buffer_append_int16(buffer, (int16_t)(100.0f*actual_rpm), &send_index);
