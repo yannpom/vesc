@@ -96,10 +96,10 @@ static volatile bool thread_can_is_running = false;
 static volatile float rpm_on = 3.0f;
 static volatile float rpm_off = 1.5f;
 static volatile float rpm_max = 100.0f;
-static volatile float rpm_mini = 30.0f;
+static volatile float rpm_mini = 20.0f;
 static volatile float min_brake_current = 0.1f;
-static volatile float max_brake_current = 20.0f;
-static volatile float current_gain = 22.00f;
+static volatile float max_brake_current = 25.0f;
+static volatile float current_gain = 18.00f; // A motor / A gene
 static volatile float pid_p = 0.8f; // Current / RPM
 static volatile float pid_i = 40.0f;
 static volatile float pid_d = 0.035f;
@@ -136,7 +136,7 @@ static Biquad watt_filter2 = {};
 
 static Biquad rear_current_filter = {};
 
-static volatile float motors_rpm[2] = {}; // 8700 = 39km/h
+static volatile float motors_rpm[2] = {}; // 3900 = 25km/h
 static volatile int gene_thread_loop_n = 0;
 
 
@@ -353,7 +353,7 @@ static THD_FUNCTION(gene_thread, arg) {
 
         // Adjust the RPM goal
         if (can_id == 1 && mode > 0) {
-            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 5500.0f * 62.0f;
+            float new_rpm_goal = fmaxf(motors_rpm[0], motors_rpm[1]) / 3900.0f * 62.0f;
             if (new_rpm_goal < rpm_mini) {
                 new_rpm_goal = rpm_mini;
             }
